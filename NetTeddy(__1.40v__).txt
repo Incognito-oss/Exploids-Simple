@@ -1,0 +1,1075 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <ifaddrs.h>
+#include <net/ethernet.h>
+#include <net/if_arp.h>
+#include <netinet/if_ether.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <linux/if_packet.h>
+#include <linux/wireless.h>
+#include <linux/if_bridge.h>
+#include <linux/if_vlan.h>
+#include <linux/if_tun.h>
+#include <linux/sockios.h>
+#include <linux/ethtool.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/filter.h>
+#include <errno.h>
+#include <dirent.h>
+#include <pthread.h>
+#include <time.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <pcap.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+// УМЕНЬШЕННЫЕ РАЗМЕРЫ ДЛЯ ИСПРАВЛЕНИЯ ОШИБОК ЛИНКОВКИ
+#define MAX_HOSTS 1000
+#define THREAD_POOL_SIZE 50
+#define PORT_LIST_SIZE 1000
+#define PCAP_BUFFER_SIZE 64 * 1024
+#define RAW_SOCKET_BUFFER 32768
+
+// Расширенные структуры данных
+typedef struct {
+    char interface[32];
+    char mac[18];
+    char ip[INET6_ADDRSTRLEN];
+    char netmask[INET6_ADDRSTRLEN];
+    char broadcast[INET6_ADDRSTRLEN];
+    char hw_type[32];
+    int mtu;
+    unsigned long long tx_bytes;
+    unsigned long long rx_bytes;
+    unsigned long tx_packets;
+    unsigned long rx_packets;
+    unsigned long tx_errors;
+    unsigned long rx_errors;
+    int is_wireless;
+    char ssid[33];
+    int signal_strength;
+    int channel;
+    char frequency[16];
+    char encryption[64];
+    char mode[16];
+    int promiscuous;
+    int speed; // Mbps
+    char duplex[16];
+    char driver[64];
+    char bus_info[64];
+} network_interface_detail_t;
+
+typedef struct {
+    char ip[INET6_ADDRSTRLEN];
+    char mac[18];
+    char hostname[NI_MAXHOST];
+    char vendor[128];
+    int is_alive;
+    int ttl;
+    int open_ports[PORT_LIST_SIZE];
+    int port_count;
+    char os_fingerprint[256];
+    int response_time;
+    time_t last_seen;
+    char services[1024];
+} host_info_detail_t;
+
+typedef struct {
+    char protocol[16];
+    char local_address[46];
+    int local_port;
+    char foreign_address[46];
+    int foreign_port;
+    char state[16];
+    int pid;
+    char program[256];
+    char user[32];
+    unsigned long inode;
+    unsigned long long tx_queue;
+    unsigned long long rx_queue;
+    time_t timestamp;
+} connection_info_detail_t;
+
+typedef struct {
+    char src_ip[INET6_ADDRSTRLEN];
+    char dst_ip[INET6_ADDRSTRLEN];
+    int src_port;
+    int dst_port;
+    char protocol[8];
+    unsigned long long bytes;
+    unsigned long packets;
+    time_t start_time;
+    time_t last_seen;
+    char application[64];
+} traffic_flow_t;
+
+// Глобальные переменные (уменьшенные размеры)
+host_info_detail_t network_hosts[MAX_HOSTS];
+int host_count = 0;
+volatile int scan_running = 1;
+pcap_t *pcap_handle = NULL;
+int raw_socket = -1;
+traffic_flow_t traffic_flows[1000]; // УМЕНЬШЕНО С 10000
+int flow_count = 0;
+pthread_mutex_t traffic_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void print_help() {
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║                 ULTIMATE NETWORK SCANNER - COMPLETE HELP GUIDE               ║\n");
+    printf("║                      Educational & Legitimate Use Only                       ║\n");
+    printf("╚══════════════════════════════════════════════════════════════════════════════╝\n\n");
+    
+    printf("📋 USAGE:\n");
+    printf("  ./ultimate_network_scanner [OPTIONS] [TARGET]\n\n");
+    
+    printf("🎯 BASIC PARAMETERS:\n");
+    printf("  [TARGET]           Network prefix for scanning (e.g., 192.168.1)\n");
+    printf("  -h, --help         Show this help message\n");
+    printf("  -v, --version      Show version information\n");
+    printf("  -q, --quiet        Quiet mode (minimal output)\n");
+    printf("  -V, --verbose      Verbose mode (maximum detail)\n\n");
+    
+    printf("🔍 SCAN MODES:\n");
+    printf("  -s, --scan         Network discovery scan\n");
+    printf("  -p, --port         Port scanning mode\n");
+    printf("  -f, --full         Full comprehensive scan (default)\n");
+    printf("  -w, --wireless     Wireless network analysis\n");
+    printf("  -t, --traffic      Traffic capture and analysis\n");
+    printf("  -m, --monitor      Real-time monitoring mode\n\n");
+    
+    printf("🎪 SCAN OPTIONS:\n");
+    printf("  --interface=IFACE  Use specific network interface\n");
+    printf("  --ports=PORTS      Custom port range (e.g., 1-1000,80,443,22)\n");
+    printf("  --threads=NUM      Number of threads (default: 50, max: 200)\n");
+    printf("  --timeout=SEC      Connection timeout in seconds\n");
+    printf("  --packets=NUM      Number of packets to capture\n");
+    printf("  --duration=SEC     Scan duration in seconds\n\n");
+    
+    // ... остальная часть help остается без изменений ...
+    printf("🚀 FEATURES SUMMARY:\n");
+    printf("  ✓ Comprehensive network discovery\n");
+    printf("  ✓ Advanced port scanning\n");
+    printf("  ✓ Wireless network analysis\n");
+    printf("  ✓ Traffic capture and analysis\n");
+    printf("  ✓ Real-time monitoring\n");
+    printf("  ✓ Multiple output formats\n");
+    printf("  ✓ Performance optimization\n");
+    printf("  ✓ Security assessment\n");
+    printf("  ✓ Extensive reporting\n\n");
+}
+
+void parse_arguments(int argc, char *argv[]) {
+    printf("[+] Parsing command line arguments...\n");
+    
+    if (argc == 1) {
+        printf("[!] No arguments provided. Running in default full scan mode.\n");
+        printf("[!] Use -h for help and available options.\n\n");
+        return;
+    }
+    
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_help();
+            exit(0);
+        }
+        else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
+            printf("Ultimate Network Scanner v2.0\n");
+            printf("Built for Linux with GCC\n");
+            printf("Educational Use Only\n");
+            exit(0);
+        }
+        else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--scan") == 0) {
+            printf("[+] Network discovery scan mode enabled\n");
+        }
+        else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) {
+            printf("[+] Port scanning mode enabled\n");
+        }
+        else if (strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--wireless") == 0) {
+            printf("[+] Wireless network analysis enabled\n");
+        }
+        else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--traffic") == 0) {
+            printf("[+] Traffic capture mode enabled\n");
+        }
+        else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--monitor") == 0) {
+            printf("[+] Real-time monitoring mode enabled\n");
+        }
+        else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--verbose") == 0) {
+            printf("[+] Verbose mode enabled\n");
+        }
+        else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0) {
+            printf("[+] Quiet mode enabled\n");
+        }
+        else if (strncmp(argv[i], "--interface=", 12) == 0) {
+            char *iface = argv[i] + 12;
+            printf("[+] Using network interface: %s\n", iface);
+        }
+        else if (strncmp(argv[i], "--ports=", 8) == 0) {
+            char *ports = argv[i] + 8;
+            printf("[+] Custom port range: %s\n", ports);
+        }
+        else if (strncmp(argv[i], "--threads=", 10) == 0) {
+            char *threads = argv[i] + 10;
+            printf("[+] Thread count: %s\n", threads);
+        }
+        else if (strncmp(argv[i], "--output=", 9) == 0) {
+            char *output = argv[i] + 9;
+            printf("[+] Output file: %s\n", output);
+        }
+        else if (i == argc - 1 && argv[i][0] != '-') {
+            // Last argument that doesn't start with '-' is treated as target
+            printf("[+] Target specified: %s\n", argv[i]);
+        }
+        else {
+            printf("[!] Unknown argument: %s\n", argv[i]);
+            printf("[!] Use -h for help\n");
+        }
+    }
+    printf("\n");
+}
+
+// Функция для выполнения команд с таймаутом
+char* execute_command_with_timeout(const char* cmd, int timeout_seconds) {
+    int pipefd[2];
+    pid_t pid;
+    char* result = malloc(65536);
+    result[0] = '\0';
+    
+    if (pipe(pipefd) == -1) {
+        return result;
+    }
+    
+    pid = fork();
+    if (pid == 0) {
+        // Дочерний процесс
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        
+        execl("/bin/sh", "sh", "-c", cmd, NULL);
+        exit(127);
+    } else if (pid > 0) {
+        // Родительский процесс
+        close(pipefd[1]);
+        
+        fd_set fds;
+        struct timeval timeout;
+        FD_ZERO(&fds);
+        FD_SET(pipefd[0], &fds);
+        
+        timeout.tv_sec = timeout_seconds;
+        timeout.tv_usec = 0;
+        
+        int ret = select(pipefd[0] + 1, &fds, NULL, NULL, &timeout);
+        if (ret > 0) {
+            ssize_t bytes_read = read(pipefd[0], result, 65535);
+            if (bytes_read > 0) {
+                result[bytes_read] = '\0';
+            }
+        } else {
+            kill(pid, SIGKILL);
+        }
+        
+        close(pipefd[0]);
+        waitpid(pid, NULL, 0);
+    }
+    
+    return result;
+}
+
+// Получение детальной информации о сетевых интерфейсах
+void get_detailed_interface_info() {
+    printf("[+] Detailed Network Interfaces Information\n");
+    printf("=============================================\n\n");
+    
+    struct ifaddrs *ifaddr, *ifa;
+    
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return;
+    }
+    
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL) continue;
+        
+        int family = ifa->ifa_addr->sa_family;
+        char* family_str = "Unknown";
+        
+        switch(family) {
+            case AF_PACKET: family_str = "AF_PACKET (Data Link)"; break;
+            case AF_INET: family_str = "AF_INET (IPv4)"; break;
+            case AF_INET6: family_str = "AF_INET6 (IPv6)"; break;
+        }
+        
+        printf("Interface: %s\n", ifa->ifa_name);
+        printf("  Family: %s\n", family_str);
+        printf("  Flags: 0x%x\n", ifa->ifa_flags);
+        
+        // Детальные флаги
+        printf("  Status: %s%s%s%s%s%s%s\n",
+               (ifa->ifa_flags & IFF_UP) ? "UP " : "DOWN ",
+               (ifa->ifa_flags & IFF_RUNNING) ? "RUNNING " : "",
+               (ifa->ifa_flags & IFF_PROMISC) ? "PROMISC " : "",
+               (ifa->ifa_flags & IFF_LOOPBACK) ? "LOOPBACK " : "",
+               (ifa->ifa_flags & IFF_BROADCAST) ? "BROADCAST " : "",
+               (ifa->ifa_flags & IFF_MULTICAST) ? "MULTICAST " : "",
+               (ifa->ifa_flags & IFF_DYNAMIC) ? "DYNAMIC " : "");
+        
+        // MAC адрес для AF_PACKET
+        if (family == AF_PACKET) {
+            struct sockaddr_ll *s = (struct sockaddr_ll*)ifa->ifa_addr;
+            printf("  MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                   s->sll_addr[0], s->sll_addr[1], s->sll_addr[2],
+                   s->sll_addr[3], s->sll_addr[4], s->sll_addr[5]);
+            printf("  Protocol: 0x%04x\n", ntohs(s->sll_protocol));
+            printf("  ARP Type: 0x%04x\n", s->sll_hatype);
+            printf("  Packet Type: 0x%02x\n", s->sll_pkttype);
+        }
+        
+        // IPv4 информация
+        if (family == AF_INET) {
+            struct sockaddr_in *ipv4 = (struct sockaddr_in*)ifa->ifa_addr;
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(ipv4->sin_addr), ip, INET_ADDRSTRLEN);
+            printf("  IPv4 Address: %s\n", ip);
+            
+            struct sockaddr_in *netmask = (struct sockaddr_in*)ifa->ifa_netmask;
+            char nm[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(netmask->sin_addr), nm, INET_ADDRSTRLEN);
+            printf("  IPv4 Netmask: %s\n", nm);
+            
+            if (ifa->ifa_broadaddr) {
+                struct sockaddr_in *broadcast = (struct sockaddr_in*)ifa->ifa_broadaddr;
+                char bc[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &(broadcast->sin_addr), bc, INET_ADDRSTRLEN);
+                printf("  IPv4 Broadcast: %s\n", bc);
+            }
+        }
+        
+        // IPv6 информация
+        if (family == AF_INET6) {
+            struct sockaddr_in6 *ipv6 = (struct sockaddr_in6*)ifa->ifa_addr;
+            char ip6[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, &(ipv6->sin6_addr), ip6, INET6_ADDRSTRLEN);
+            printf("  IPv6 Address: %s\n", ip6);
+            printf("  IPv6 Scope: %d\n", ipv6->sin6_scope_id);
+        }
+        
+        // Получение MTU и другой информации через ioctl
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            struct ifreq ifr;
+            strcpy(ifr.ifr_name, ifa->ifa_name);
+            
+            if (ioctl(sock, SIOCGIFMTU, &ifr) == 0) {
+                printf("  MTU: %d\n", ifr.ifr_mtu);
+            }
+            
+            if (ioctl(sock, SIOCGIFHWADDR, &ifr) == 0) {
+                unsigned char *mac = (unsigned char*)ifr.ifr_hwaddr.sa_data;
+                printf("  Hardware MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            }
+            
+            close(sock);
+        }
+        
+        printf("---------------------------------------------\n");
+    }
+    
+    freeifaddrs(ifaddr);
+}
+
+// Получение расширенной статистики интерфейсов
+void get_extended_interface_stats() {
+    printf("\n[+] Extended Network Interface Statistics\n");
+    printf("=============================================\n\n");
+    
+    // Чтение /proc/net/dev с более детальной информацией
+    FILE *fp = fopen("/proc/net/dev", "r");
+    if (!fp) {
+        perror("fopen /proc/net/dev");
+        return;
+    }
+    
+    char line[512];
+    fgets(line, sizeof(line), fp); // Пропускаем заголовки
+    fgets(line, sizeof(line), fp);
+    
+    printf("%-15s %12s %12s %8s %8s %8s %8s %12s %12s %8s %8s %8s %8s\n",
+           "Interface", "RX Bytes", "RX Packets", "RX Errs", "RX Drop", 
+           "RX Fifo", "RX Frame", "TX Bytes", "TX Packets", "TX Errs",
+           "TX Drop", "TX Fifo", "TX Frame");
+    printf("--------------------------------------------------------------------------------------------------------------------\n");
+    
+    while (fgets(line, sizeof(line), fp)) {
+        char interface[32];
+        unsigned long long rx_bytes, rx_packets, rx_errs, rx_drop, rx_fifo, rx_frame;
+        unsigned long long tx_bytes, tx_packets, tx_errs, tx_drop, tx_fifo, tx_frame;
+        
+        sscanf(line, "%s %llu %llu %llu %llu %llu %llu %*u %*u %llu %llu %llu %llu %llu %llu",
+               interface, &rx_bytes, &rx_packets, &rx_errs, &rx_drop, &rx_fifo, &rx_frame,
+               &tx_bytes, &tx_packets, &tx_errs, &tx_drop, &tx_fifo, &tx_frame);
+        
+        // Убираем двоеточие
+        char *colon = strchr(interface, ':');
+        if (colon) *colon = '\0';
+        
+        printf("%-15s %12llu %12llu %8llu %8llu %8llu %8llu %12llu %12llu %8llu %8llu %8llu %8llu\n",
+               interface, rx_bytes, rx_packets, rx_errs, rx_drop, rx_fifo, rx_frame,
+               tx_bytes, tx_packets, tx_errs, tx_drop, tx_fifo, tx_frame);
+    }
+    
+    fclose(fp);
+}
+
+// Простая функция для расчета канала из частоты
+int calculate_channel(double freq_mhz) {
+    // 2.4 GHz band
+    if (freq_mhz >= 2412 && freq_mhz <= 2484) {
+        return (int)((freq_mhz - 2407) / 5);
+    }
+    // 5 GHz band
+    else if (freq_mhz >= 5170 && freq_mhz <= 5825) {
+        return (int)((freq_mhz - 5000) / 5);
+    }
+    return -1; // Unknown channel
+}
+
+// Функция для получения информации о беспроводных интерфейсах
+void get_wireless_extended_info() {
+    printf("\n[+] Extended Wireless Information\n");
+    printf("=============================================\n\n");
+    
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return;
+    }
+    
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_PACKET)
+            continue;
+        
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) continue;
+        
+        struct iwreq wrq;
+        strncpy(wrq.ifr_name, ifa->ifa_name, IFNAMSIZ);
+        
+        // Проверяем, является ли интерфейс беспроводным
+        if (ioctl(sock, SIOCGIWNAME, &wrq) == 0) {
+            printf("Wireless Interface: %s\n", ifa->ifa_name);
+            printf("  Protocol: %s\n", wrq.u.name);
+            
+            // Получение ESSID
+            char essid[IW_ESSID_MAX_SIZE + 1];
+            wrq.u.essid.pointer = essid;
+            wrq.u.essid.length = IW_ESSID_MAX_SIZE + 1;
+            wrq.u.essid.flags = 0;
+            
+            if (ioctl(sock, SIOCGIWESSID, &wrq) == 0) {
+                essid[wrq.u.essid.length] = '\0';
+                printf("  SSID: %s\n", essid);
+            }
+            
+            // Получение качества сигнала
+            struct iw_statistics stats;
+            wrq.u.data.pointer = &stats;
+            wrq.u.data.length = sizeof(stats);
+            wrq.u.data.flags = 1;
+            
+            if (ioctl(sock, SIOCGIWSTATS, &wrq) == 0) {
+                printf("  Signal Quality: %d/%d\n", 
+                       stats.qual.qual, IW_QUAL_QUAL_INVALID);
+                printf("  Signal Level: %d dBm\n", stats.qual.level - 256);
+                printf("  Signal Noise: %d dBm\n", stats.qual.noise - 256);
+            }
+            
+            // Получение частоты
+            struct iw_freq freq;
+            wrq.u.freq = freq;
+            if (ioctl(sock, SIOCGIWFREQ, &wrq) == 0) {
+                printf("  Frequency: %.3f GHz\n", 
+                       (double)wrq.u.freq.m / 1000000000.0);
+                double freq_mhz = (double)wrq.u.freq.m / 1000000.0;
+                int channel = calculate_channel(freq_mhz);
+                if (channel != -1) {
+                    printf("  Channel: %d\n", channel);
+                } else {
+                    printf("  Channel: Unknown\n");
+                }
+            }
+            
+            // Получение режима
+            if (ioctl(sock, SIOCGIWMODE, &wrq) == 0) {
+                const char* modes[] = {
+                    "Auto", "Ad-Hoc", "Managed", "Master", 
+                    "Repeater", "Secondary", "Monitor"
+                };
+                if (wrq.u.mode >= 0 && wrq.u.mode <= 6) {
+                    printf("  Mode: %s\n", modes[wrq.u.mode]);
+                }
+            }
+            
+            printf("---------------------------------------------\n");
+        }
+        
+        close(sock);
+    }
+    
+    freeifaddrs(ifaddr);
+}
+
+// Функция для сканирования сети с использованием ARP
+void* arp_scan_network(void* arg) {
+    char* network_prefix = (char*)arg;
+    
+    for (int i = 1; i < 255; i++) {
+        char target_ip[16];
+        snprintf(target_ip, sizeof(target_ip), "%s.%d", network_prefix, i);
+        
+        // Создаем RAW сокет для ARP
+        int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
+        if (sock < 0) {
+            perror("socket");
+            continue;
+        }
+        
+        // Подготавливаем ARP запрос
+        struct sockaddr_ll socket_address;
+        unsigned char buffer[256];
+        struct ethhdr *eth = (struct ethhdr *)buffer;
+        struct arphdr *arp = (struct arphdr *)(buffer + sizeof(struct ethhdr));
+        
+        // Заполняем Ethernet заголовок
+        memset(eth->h_dest, 0xff, ETH_ALEN); // Broadcast
+        memset(eth->h_source, 0x12, ETH_ALEN); // Source MAC (фиктивный)
+        eth->h_proto = htons(ETH_P_ARP);
+        
+        // Заполняем ARP запрос
+        arp->ar_hrd = htons(ARPHRD_ETHER);
+        arp->ar_pro = htons(ETH_P_IP);
+        arp->ar_hln = ETH_ALEN;
+        arp->ar_pln = 4;
+        arp->ar_op = htons(ARPOP_REQUEST);
+        
+        // Заполняем данные ARP
+        unsigned char *arp_data = (unsigned char*)(arp + 1);
+        memset(arp_data, 0x12, ETH_ALEN); // Source MAC
+        struct in_addr src_ip, dst_ip;
+        inet_pton(AF_INET, "192.168.1.100", &src_ip); // Фиктивный source IP
+        inet_pton(AF_INET, target_ip, &dst_ip);
+        memcpy(arp_data + ETH_ALEN, &src_ip, 4);
+        memset(arp_data + ETH_ALEN + 4, 0x00, ETH_ALEN); // Target MAC
+        memcpy(arp_data + ETH_ALEN + 4 + ETH_ALEN, &dst_ip, 4);
+        
+        // Настраиваем интерфейс
+        memset(&socket_address, 0, sizeof(socket_address));
+        socket_address.sll_family = AF_PACKET;
+        socket_address.sll_protocol = htons(ETH_P_ARP);
+        socket_address.sll_ifindex = if_nametoindex("eth0"); // Замените на нужный интерфейс
+        if (socket_address.sll_ifindex == 0) {
+            close(sock);
+            continue;
+        }
+        socket_address.sll_hatype = htons(ARPHRD_ETHER);
+        socket_address.sll_pkttype = PACKET_BROADCAST;
+        socket_address.sll_halen = ETH_ALEN;
+        memset(socket_address.sll_addr, 0xff, ETH_ALEN);
+        
+        // Отправляем ARP запрос
+        if (sendto(sock, buffer, 42, 0, 
+                   (struct sockaddr*)&socket_address, sizeof(socket_address)) > 0) {
+            printf("ARP request sent to %s\n", target_ip);
+        }
+        
+        close(sock);
+        usleep(1000); // 1ms задержка
+    }
+    
+    free(network_prefix);
+    return NULL;
+}
+
+// Функция для захвата сетевого трафика
+void* packet_capture_thread(void* arg) {
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *handle;
+    
+    // Открываем интерфейс для захвата
+    handle = pcap_open_live("eth0", BUFSIZ, 1, 1000, errbuf);
+    if (handle == NULL) {
+        fprintf(stderr, "Couldn't open device: %s\n", errbuf);
+        return NULL;
+    }
+    
+    // Компилируем и применяем фильтр
+    struct bpf_program fp;
+    char filter_exp[] = "ip or arp or tcp or udp";
+    if (pcap_compile(handle, &fp, filter_exp, 0, PCAP_NETMASK_UNKNOWN) == -1) {
+        fprintf(stderr, "Couldn't parse filter %s: %s\n", filter_exp, pcap_geterr(handle));
+        pcap_close(handle);
+        return NULL;
+    }
+    if (pcap_setfilter(handle, &fp) == -1) {
+        fprintf(stderr, "Couldn't install filter %s: %s\n", filter_exp, pcap_geterr(handle));
+        pcap_freecode(&fp);
+        pcap_close(handle);
+        return NULL;
+    }
+    
+    pcap_freecode(&fp);
+    
+    printf("[+] Starting packet capture...\n");
+    
+    // Захватываем пакеты
+    struct pcap_pkthdr header;
+    const u_char *packet;
+    int packet_count = 0;
+    
+    while (scan_running && packet_count < 100) { // Ограничим для примера
+        packet = pcap_next(handle, &header);
+        if (packet == NULL) continue;
+        
+        packet_count++;
+        
+        // Анализируем пакет
+        struct ether_header *eth_header = (struct ether_header*)packet;
+        
+        if (ntohs(eth_header->ether_type) == ETHERTYPE_IP) {
+            struct ip *ip_header = (struct ip*)(packet + sizeof(struct ether_header));
+            
+            pthread_mutex_lock(&traffic_mutex);
+            
+            // Обновляем статистику потоков
+            int flow_index = -1;
+            for (int i = 0; i < flow_count && i < 1000; i++) {
+                if (strcmp(traffic_flows[i].src_ip, inet_ntoa(ip_header->ip_src)) == 0 &&
+                    strcmp(traffic_flows[i].dst_ip, inet_ntoa(ip_header->ip_dst)) == 0) {
+                    flow_index = i;
+                    break;
+                }
+            }
+            
+            if (flow_index == -1 && flow_count < 1000) {
+                flow_index = flow_count++;
+                strcpy(traffic_flows[flow_index].src_ip, inet_ntoa(ip_header->ip_src));
+                strcpy(traffic_flows[flow_index].dst_ip, inet_ntoa(ip_header->ip_dst));
+                traffic_flows[flow_index].packets = 0;
+                traffic_flows[flow_index].bytes = 0;
+                traffic_flows[flow_index].start_time = time(NULL);
+            }
+            
+            if (flow_index != -1) {
+                traffic_flows[flow_index].packets++;
+                traffic_flows[flow_index].bytes += header.len;
+                traffic_flows[flow_index].last_seen = time(NULL);
+                
+                // Определяем протокол
+                if (ip_header->ip_p == IPPROTO_TCP) {
+                    strcpy(traffic_flows[flow_index].protocol, "TCP");
+                    struct tcphdr *tcp_header = (struct tcphdr*)(packet + sizeof(struct ether_header) + (ip_header->ip_hl * 4));
+                    traffic_flows[flow_index].src_port = ntohs(tcp_header->th_sport);
+                    traffic_flows[flow_index].dst_port = ntohs(tcp_header->th_dport);
+                } else if (ip_header->ip_p == IPPROTO_UDP) {
+                    strcpy(traffic_flows[flow_index].protocol, "UDP");
+                    struct udphdr *udp_header = (struct udphdr*)(packet + sizeof(struct ether_header) + (ip_header->ip_hl * 4));
+                    traffic_flows[flow_index].src_port = ntohs(udp_header->uh_sport);
+                    traffic_flows[flow_index].dst_port = ntohs(udp_header->uh_dport);
+                }
+            }
+            
+            pthread_mutex_unlock(&traffic_mutex);
+        }
+    }
+    
+    pcap_close(handle);
+    printf("[+] Packet capture completed. Captured %d packets.\n", packet_count);
+    return NULL;
+}
+
+// Функция для отображения статистики трафика
+void show_traffic_statistics() {
+    printf("\n[+] Traffic Flow Statistics\n");
+    printf("=============================================\n\n");
+    
+    pthread_mutex_lock(&traffic_mutex);
+    
+    printf("%-15s %-15s %-8s %-6s %-6s %10s %10s %8s\n",
+           "Source IP", "Dest IP", "Proto", "Src Port", "Dst Port", 
+           "Packets", "Bytes", "Duration");
+    printf("--------------------------------------------------------------------------------\n");
+    
+    for (int i = 0; i < flow_count && i < 50; i++) { // Покажем первые 50 потоков
+        int duration = (int)(traffic_flows[i].last_seen - traffic_flows[i].start_time);
+        printf("%-15s %-15s %-8s %-6d %-6d %10lu %10llu %8ds\n",
+               traffic_flows[i].src_ip, traffic_flows[i].dst_ip,
+               traffic_flows[i].protocol, traffic_flows[i].src_port,
+               traffic_flows[i].dst_port, traffic_flows[i].packets,
+               traffic_flows[i].bytes, duration);
+    }
+    
+    pthread_mutex_unlock(&traffic_mutex);
+}
+
+// Функция для глубокого сканирования портов с определением сервисов
+void* deep_port_scan(void* arg) {
+    char* target_ip = (char*)arg;
+    struct timeval timeout;
+    timeout.tv_sec = 2;
+    timeout.tv_usec = 0;
+    
+    printf("Deep scanning %s:\n", target_ip);
+    
+    // Сканируем широкий диапазон портов
+    for (int port = 1; port <= 1000; port++) { // УМЕНЬШЕНО ДО 1000 ПОРТОВ
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) continue;
+        
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        
+        struct sockaddr_in target;
+        target.sin_family = AF_INET;
+        target.sin_port = htons(port);
+        inet_pton(AF_INET, target_ip, &target.sin_addr);
+        
+        if (connect(sock, (struct sockaddr*)&target, sizeof(target)) == 0) {
+            printf("  Port %d: OPEN - ", port);
+            
+            // Пытаемся определить сервис
+            char banner[1024] = {0};
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(sock, &read_fds);
+            
+            struct timeval banner_timeout = {2, 0};
+            if (select(sock + 1, &read_fds, NULL, NULL, &banner_timeout) > 0) {
+                ssize_t bytes = recv(sock, banner, sizeof(banner) - 1, MSG_PEEK);
+                if (bytes > 0) {
+                    banner[bytes] = '\0';
+                    // Базовая идентификация по баннеру
+                    if (strstr(banner, "SSH")) printf("SSH");
+                    else if (strstr(banner, "HTTP")) printf("HTTP");
+                    else if (strstr(banner, "FTP")) printf("FTP");
+                    else if (strstr(banner, "SMTP")) printf("SMTP");
+                    else printf("Unknown (banner: %.50s)", banner);
+                } else {
+                    // Идентификация по номеру порта
+                    switch(port) {
+                        case 21: printf("FTP"); break;
+                        case 22: printf("SSH"); break;
+                        case 23: printf("Telnet"); break;
+                        case 25: printf("SMTP"); break;
+                        case 53: printf("DNS"); break;
+                        case 80: printf("HTTP"); break;
+                        case 110: printf("POP3"); break;
+                        case 143: printf("IMAP"); break;
+                        case 443: printf("HTTPS"); break;
+                        case 993: printf("IMAPS"); break;
+                        case 995: printf("POP3S"); break;
+                        case 3306: printf("MySQL"); break;
+                        case 3389: printf("RDP"); break;
+                        case 5432: printf("PostgreSQL"); break;
+                        default: printf("Unknown");
+                    }
+                }
+            } else {
+                printf("Unknown (no banner)");
+            }
+            printf("\n");
+            
+            // Отправляем специфичные для протокола запросы
+            if (port == 80 || port == 443) {
+                char http_request[] = "GET / HTTP/1.0\r\n\r\n";
+                send(sock, http_request, strlen(http_request), 0);
+                
+                char response[4096];
+                ssize_t bytes = recv(sock, response, sizeof(response) - 1, 0);
+                if (bytes > 0) {
+                    response[bytes] = '\0';
+                    char* server_header = strstr(response, "Server:");
+                    if (server_header) {
+                        char* end = strstr(server_header, "\r\n");
+                        if (end) {
+                            *end = '\0';
+                            printf("    Server: %s\n", server_header);
+                        }
+                    }
+                }
+            }
+        }
+        
+        close(sock);
+        
+        // Ограничиваем скорость сканирования
+        if (port % 100 == 0) {
+            usleep(100000); // 100ms каждые 100 портов
+        }
+    }
+    
+    free(target_ip);
+    return NULL;
+}
+
+// Функция для получения информации о сетевых устройствах через sysfs
+void get_sysfs_network_info() {
+    printf("\n[+] Sysfs Network Device Information\n");
+    printf("=============================================\n\n");
+    
+    DIR *dir;
+    struct dirent *entry;
+    
+    // Читаем /sys/class/net
+    dir = opendir("/sys/class/net");
+    if (dir == NULL) {
+        perror("opendir /sys/class/net");
+        return;
+    }
+    
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        
+        printf("Device: %s\n", entry->d_name);
+        
+        // Читаем различные атрибуты
+        char path[512];
+        FILE *fp;
+        char line[256];
+        
+        // MAC адрес
+        snprintf(path, sizeof(path), "/sys/class/net/%s/address", entry->d_name);
+        fp = fopen(path, "r");
+        if (fp) {
+            if (fgets(line, sizeof(line), fp)) {
+                printf("  MAC: %s", line);
+            }
+            fclose(fp);
+        }
+        
+        // MTU
+        snprintf(path, sizeof(path), "/sys/class/net/%s/mtu", entry->d_name);
+        fp = fopen(path, "r");
+        if (fp) {
+            if (fgets(line, sizeof(line), fp)) {
+                printf("  MTU: %s", line);
+            }
+            fclose(fp);
+        }
+        
+        // Скорость
+        snprintf(path, sizeof(path), "/sys/class/net/%s/speed", entry->d_name);
+        fp = fopen(path, "r");
+        if (fp) {
+            if (fgets(line, sizeof(line), fp)) {
+                printf("  Speed: %s Mbps", line);
+            }
+            fclose(fp);
+        }
+        
+        // Duplex
+        snprintf(path, sizeof(path), "/sys/class/net/%s/duplex", entry->d_name);
+        fp = fopen(path, "r");
+        if (fp) {
+            if (fgets(line, sizeof(line), fp)) {
+                printf("  Duplex: %s", line);
+            }
+            fclose(fp);
+        }
+        
+        // Carrier
+        snprintf(path, sizeof(path), "/sys/class/net/%s/carrier", entry->d_name);
+        fp = fopen(path, "r");
+        if (fp) {
+            if (fgets(line, sizeof(line), fp)) {
+                printf("  Carrier: %s", line);
+            }
+            fclose(fp);
+        }
+        
+        // Device driver
+        snprintf(path, sizeof(path), "/sys/class/net/%s/device/driver", entry->d_name);
+        char driver_path[512];
+        ssize_t len = readlink(path, driver_path, sizeof(driver_path)-1);
+        if (len != -1) {
+            driver_path[len] = '\0';
+            char *driver_name = strrchr(driver_path, '/');
+            if (driver_name) {
+                printf("  Driver: %s\n", driver_name + 1);
+            }
+        }
+        
+        printf("---------------------------------------------\n");
+    }
+    
+    closedir(dir);
+}
+
+// Функция для мониторинга сетевых соединений в реальном времени
+void monitor_network_connections_realtime() {
+    printf("\n[+] Real-time Network Connections Monitor\n");
+    printf("=============================================\n\n");
+    printf("Monitoring active connections (refresh every 5 seconds)...\n");
+    printf("Press Ctrl+C to stop monitoring\n\n");
+    
+    for (int i = 0; i < 6 && scan_running; i++) { // Мониторим 30 секунд
+        char* result = execute_command_with_timeout(
+            "ss -tupan | grep -v '127.0.0.1' | head -20", 2);
+        if (result) {
+            printf("=== Snapshot %d ===\n%s\n", i + 1, result);
+            free(result);
+        }
+        sleep(5);
+    }
+}
+
+// Главная функция
+int main(int argc, char *argv[]) {
+    printf("╔══════════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║                    ULTIMATE NETWORK SCANNER v2.0                            ║\n");
+    printf("║                  Comprehensive Network Analysis Tool                        ║\n");
+    printf("║                         Educational Use Only                               ║\n");
+    printf("╚══════════════════════════════════════════════════════════════════════════════╝\n\n");
+
+    char question[10];
+
+    printf("Info Y/N: ");
+    fgets(question, sizeof(question), stdin);
+
+    if (question[0] == 'Y' || question[0] == 'y') {
+        parse_arguments(argc, argv);
+    } else {
+        printf("Skipping info...\n");
+    }
+    
+    // Проверка прав
+    if (geteuid() != 0) {
+        printf("[!] Warning: Running without root privileges.\n");
+        printf("[!] Many features will be limited.\n");
+        printf("[!] For full functionality run as root: sudo %s\n\n", argv[0]);
+    }
+    
+    time_t start_time = time(NULL);
+    printf("[+] Scan started at: %s", ctime(&start_time));
+    
+    // Сбор ВСЕЙ возможной информации
+    get_detailed_interface_info();
+    get_extended_interface_stats();
+    get_wireless_extended_info();
+    get_sysfs_network_info();
+    
+    // Расширенная сетевая информация
+    char* result;
+    
+    printf("\n[+] Advanced Routing Information\n");
+    printf("=============================================\n\n");
+    result = execute_command_with_timeout("ip route show table all", 5);
+    if (result) { printf("%s\n", result); free(result); }
+    
+    printf("\n[+] Network Namespaces\n");
+    printf("=============================================\n\n");
+    result = execute_command_with_timeout("ip netns list", 3);
+    if (result) { printf("%s\n", result); free(result); }
+    
+    printf("\n[+] Bridge Information\n");
+    printf("=============================================\n\n");
+    result = execute_command_with_timeout("brctl show 2>/dev/null || bridge link show", 3);
+    if (result) { printf("%s\n", result); free(result); }
+    
+    printf("\n[+] VLAN Information\n");
+    printf("=============================================\n\n");
+    result = execute_command_with_timeout("ip -d link show | grep vlan", 3);
+    if (result) { printf("%s\n", result); free(result); }
+    
+    printf("\n[+] IP Tunnel Information\n");
+    printf("=============================================\n\n");
+    result = execute_command_with_timeout("ip tunnel show", 3);
+    if (result) { printf("%s\n", result); free(result); }
+    
+    // Запуск захвата трафика в отдельном потоке
+    pthread_t capture_thread;
+    if (geteuid() == 0) {
+        if (pthread_create(&capture_thread, NULL, packet_capture_thread, NULL) != 0) {
+            printf("[-] Failed to create capture thread\n");
+        }
+    }
+    
+    // Мониторинг в реальном времени
+    monitor_network_connections_realtime();
+    
+    // Остановка захвата трафика
+    if (geteuid() == 0) {
+        scan_running = 0;
+        pthread_join(capture_thread, NULL);
+        show_traffic_statistics();
+    }
+    
+    // Глубокое сканирование сети если указан параметр
+    if (argc > 1 && argv[1][0] != '-') {
+        printf("\n[!] Starting deep network scan...\n");
+        
+        pthread_t scan_threads[3];
+        int thread_count = 0;
+        
+        // Сканируем несколько хостов параллельно
+        for (int i = 1; i < 4 && thread_count < 3; i++) {
+            char* target_ip = malloc(16);
+            snprintf(target_ip, 16, "%s.%d", argv[1], i);
+            
+            if (pthread_create(&scan_threads[thread_count], NULL, deep_port_scan, target_ip) == 0) {
+                thread_count++;
+            } else {
+                free(target_ip);
+            }
+            
+            // Ограничиваем количество одновременных сканирований
+            if (thread_count >= 3) {
+                for (int j = 0; j < thread_count; j++) {
+                    pthread_join(scan_threads[j], NULL);
+                }
+                thread_count = 0;
+            }
+        }
+        
+        // Ждем завершения оставшихся потоков
+        for (int i = 0; i < thread_count; i++) {
+            pthread_join(scan_threads[i], NULL);
+        }
+    }
+    
+    time_t end_time = time(NULL);
+    printf("\n[+] Scan completed at: %s", ctime(&end_time));
+    printf("[+] Total scan duration: %ld seconds\n", end_time - start_time);
+    
+    printf("\n[!] LEGAL NOTICE:\n");
+    printf("    This tool is for educational and legitimate network administration only.\n");
+    printf("    Use only on systems you own or have explicit permission to test.\n");
+    printf("    Unauthorized network scanning may be illegal in your jurisdiction.\n");
+    
+    return 0;
+}
+
+// # BASH Commads:
+// sudo apt update
+// sudo apt install build-essential libpcap-dev libssl-dev
+// gcc -o NetTeddy(__1.40v__) NetTeddy(__1.40v__).c -lpcap -lpthread -lssl -lcrypto
